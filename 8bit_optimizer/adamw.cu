@@ -4,6 +4,8 @@
 #include <cub/block/block_reduce.cuh>
 #include <cub/cub.cuh>
 
+// To compile: nvcc adamw.cu -o adamw.out
+
 template <int SIGNED>
 __device__ unsigned char quantize(float* quantization_code, int n, float x) {
     /**
