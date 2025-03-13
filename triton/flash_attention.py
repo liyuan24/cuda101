@@ -10,7 +10,7 @@ import torch
     }
 )
 @triton.jit
-def forward_kernel(
+def _forward_kernel(
     q, # query pointer
     k, # key pointer
     v, # value pointer
@@ -137,7 +137,7 @@ def _flash_attention_forward(q, k, v, scale: float=None, is_causal: bool=False):
     
     grid = lambda META: (triton.cdiv(q_seq_len, META["BLOCK_M"]), b * n_heads)
     
-    forward_kernel[grid](
+    _forward_kernel[grid](
         q,
         k,
         v,
