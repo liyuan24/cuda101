@@ -345,23 +345,26 @@ def _backward_kernel(
             delta_block = tl.load(delta_ptrs)
         else:
             delta_block = tl.load(delta_ptrs, mask=offsets_m < seqlen_q, other=0.0)
-            
-        ds_block = ((dp_block * p_block - delta_block[:, None] * p_block) / scale).cast(q_block.dtype)
         
-        # s = qkT
+        # we need to multiply the scale instead of dividing because S = scale * qkT, dL/dq = dL/dS * dS/dq * scale and same for dk
+        ds_block = ((dp_block * p_block - delta_block[:, None] * p_block) * scale).cast(q_block.dtype)
+        
+        # s = scale * qkT
         # load dq block
         dq_ptrs = dq + b_idx * stride_dqb + h_idx * stride_dqh + offsets_m[:, None] * stride_dqm + offsets_d[None, :]
-        if EVEN_M:
-            dq_block = tl.load(dq_ptrs)
-        else:
-            dq_block = tl.load(dq_ptrs, mask=offsets_m[:, None] < seqlen_q, other=0.0)
+        # if EVEN_M:
+        #     dq_block = tl.load(dq_ptrs)
+        # else:
+        #     dq_block = tl.load(dq_ptrs, mask=offsets_m[:, None] < seqlen_q, other=0.0)
             
-        dq_block += tl.dot(ds_block, k_block)
-        # write back dq block
-        if EVEN_M:
-            tl.store(dq_ptrs, dq_block)
-        else:
-            tl.store(dq_ptrs, dq_block, mask=offsets_m[:, None] < seqlen_q)
+        # dq_block += tl.dot(ds_block, k_block)
+        # # write back dq block
+        # if EVEN_M:
+        #     tl.store(dq_ptrs, dq_block)
+        # else:
+        #     tl.store(dq_ptrs, dq_block, mask=offsets_m[:, None] < seqlen_q)
+        dq_block = tl.dot(ds_block, k_block)
+        tl.atomic_add(dq_ptrs, dq_block, mask=offsets_m[:, None] < seqlen_q)
             
         dk_block += tl.dot(ds_block.trans(), q_block)
     
@@ -462,43 +465,6 @@ def _flash_attention_backward(q, k, v, o, do, dq, dk, dv, lse, scale: float=None
     
     return dq, dk, dv
 
-def flash_attention_backward_test(q, k, v, o, do, lse):
-    b, n_heads, q_seq_len, head_dim = q.shape
-    _, _ , k_seq_len, _ = k.shape
-    
-    # assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous() and o.is_contiguous() and do.is_contiguous() and dq.is_contiguous() and dk.is_contiguous() and dv.is_contiguous() and lse.is_contiguous()
-    assert k.shape == (b, n_heads, k_seq_len, head_dim)
-    assert v.shape == (b, n_heads, k_seq_len, head_dim)
-    # assert q.is_cuda and k.is_cuda and v.is_cuda and o.is_cuda and do.is_cuda and dq.is_cuda and dk.is_cuda and dv.is_cuda and lse.is_cuda
-        
-    delta = torch.empty_like(lse)
-    
-    BLOCK = 64
-    num_warps = 4
-    num_stages = 1
-    
-    grid = lambda META: (triton.cdiv(q_seq_len, META["BLOCK_M"]), b * n_heads)
-    
-    _backward_o_do_elementwise_product_kernel[grid](
-        o, 
-        do, 
-        delta,      
-        o.stride(0), 
-        o.stride(1), 
-        o.stride(2), 
-        do.stride(0), 
-        do.stride(1), 
-        do.stride(2), 
-        n_heads, 
-        q_seq_len, 
-        BLOCK_M=BLOCK, 
-        HEAD_DIM=head_dim,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
-    
-    return delta
-
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, is_causal=False, scale=None):
@@ -521,7 +487,13 @@ class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         q, k, v, o, lse = ctx.saved_tensors
-        dq = torch.empty_like(q)
+        # different from Tri Dao's implementation https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/flash_attn_triton.py#L1044
+        # where dq is initialized as torch.empty_like(q)
+        # but since we use atomic_add to update dq, if the initial value is not 0, the accumulation for dq will be incorrect
+        # so we initialize dq as torch.zeros_like(q)
+        dq = torch.zeros_like(q)
+        # for dk and dv, since we only store the local value back to the original memory, the initial values are not important
+        # so we can use torch.empty_like(k) and torch.empty_like(v)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         _flash_attention_backward(
@@ -534,9 +506,9 @@ class FlashAttnFunc(torch.autograd.Function):
 def test_forward(is_causal: bool=False):
     torch.manual_seed(0)
     data_type = torch.float32
-    q = torch.randn(1, 1, 16, 16, dtype=data_type).cuda()
-    k = torch.randn(1, 1, 16, 16, dtype=data_type).cuda()
-    v = torch.randn(1, 1, 16, 16, dtype=data_type).cuda()
+    q = torch.randn(1, 1, 32, 16, dtype=data_type).cuda()
+    k = torch.randn(1, 1, 32, 16, dtype=data_type).cuda()
+    v = torch.randn(1, 1, 32, 16, dtype=data_type).cuda()
     
     o, lse = _flash_attention_forward(q, k, v, is_causal=is_causal)
     
@@ -549,9 +521,11 @@ def test_forward(is_causal: bool=False):
     qkT = q @ k.transpose(-2, -1)
     scale = 1.0 / math.sqrt(q.shape[-1])
     qkT = qkT * scale
+    if is_causal:
+        mask = torch.where(torch.arange(q.shape[-2])[:, None] >= torch.arange(k.shape[-2])[None, :], 0.0, -float("inf")).to(qkT.device)
+        qkT += mask
     max_value = torch.max(qkT, dim=-1).values
     lse_torch = torch.logsumexp(qkT - max_value[..., None], dim=-1) + max_value
-    
     assert torch.allclose(lse, lse_torch, atol=1e-2)
     
     
@@ -562,15 +536,6 @@ def test_backward(is_causal: bool=False):
     k = torch.randn(1, 1, 16, 16, dtype=data_type).cuda().requires_grad_(True)
     v = torch.randn(1, 1, 16, 16, dtype=data_type).cuda().requires_grad_(True)
     do = torch.randn_like(q)
-    print("do:", do)
-    # ref_delta = torch.sum(do * o, dim=-1)
-    
-    # delta = flash_attention_backward_test(q, k, v, o, do, lse)
-    
-    # print(f"delta: {delta}")
-    # print(f"ref_delta: {ref_delta}")
-    
-    # assert torch.allclose(delta, ref_delta, atol=1e-2)
     
     # torch attention
     o_torch = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
@@ -588,17 +553,14 @@ def test_backward(is_causal: bool=False):
     triton_dk, k.grad = k.grad.clone(), None
     triton_dq, q.grad = q.grad.clone(), None
     
-    # print(f"torch dq: {torch_dq[0, 0, 0, :]}")
-    # print(f"triton dq: {triton_dq[0, 0, 0, :]}")
-    
-    # assert torch.allclose(torch_dq, triton_dq, atol=1e-2)
-    # assert torch.allclose(torch_dk, triton_dk, atol=1e-2)test_forward
-    # test_forward(is_causal=True)
-    # test_forward(is_causal=False)
+    assert torch.allclose(torch_dv, triton_dv, atol=1e-2)
+    assert torch.allclose(torch_dk, triton_dk, atol=1e-2)
+    assert torch.allclose(torch_dq, triton_dq, atol=1e-2)
     
 if __name__ == "__main__":
-    # test_backward()
+    test_backward()
+    test_backward(is_causal=True)
     test_forward()
-    # test_forward(is_causal=True)
+    test_forward(is_causal=True)
     
     
