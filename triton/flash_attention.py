@@ -3,6 +3,7 @@ import triton.language as tl
 import math
 import torch
 
+
 @triton.heuristics(
     {
         "EVEN_M": lambda args: args["seqlen_q"] // args["BLOCK_M"] == 0,
@@ -28,6 +29,8 @@ def _forward_kernel(
     stride_ob, # output batch dimension stride
     stride_oh, # output head dimension stride
     stride_om, # output sequence length dimension stride
+    stride_lseb, # lse batch dimension stride
+    stride_lseh, # lse head dimension stride
     nheads, # number of attention heads,
     seqlen_q, # the query sequence length
     seqlen_k, # the key sequence length,
@@ -95,14 +98,13 @@ def _forward_kernel(
         cur_max = tl.max(qkT, axis=1)
         new_max = tl.maximum(max_block, cur_max)
         p = tl.exp(qkT - new_max[:, None])
-        lse_block = lse_block * tl.exp(cur_max - new_max) + tl.sum(p, axis=1)
+        lse_block = lse_block * tl.exp(max_block - new_max) + tl.sum(p, axis=1)
         p = p.cast(v_block.dtype)
-        acc_block = acc_block * tl.exp(cur_max - new_max)[:, None] + tl.dot(p, v_block)
+        acc_block = acc_block * tl.exp(max_block - new_max)[:, None] + tl.dot(p, v_block)
         max_block = new_max
     
     acc_block = acc_block / lse_block[:, None]
     lse_block = tl.log(lse_block) + max_block
-    
     # store the acc_block to output block
     o_ptrs = o + b_idx * stride_ob + h_idx * stride_oh + offsets_m[:, None] * stride_om + offsets_d[None, :]
     if EVEN_M:
@@ -110,7 +112,7 @@ def _forward_kernel(
     else:
         tl.store(o_ptrs, acc_block, mask=offsets_m[:, None] < seqlen_q)
     
-    lse_ptrs = lse + b_idx * stride_ob + h_idx * stride_oh + offsets_m
+    lse_ptrs = lse + b_idx * stride_lseb + h_idx * stride_lseh + offsets_m
     if EVEN_M:
         tl.store(lse_ptrs, lse_block)
     else:
@@ -155,6 +157,8 @@ def _flash_attention_forward(q, k, v, scale: float=None, is_causal: bool=False):
         o.stride(0), 
         o.stride(1), 
         o.stride(2), 
+        lse.stride(0),
+        lse.stride(1),
         n_heads, 
         q_seq_len, 
         k_seq_len, 
@@ -258,6 +262,8 @@ def _backward_kernel(
     stride_dvb, # the value gradient batch dimension stride
     stride_dvh, # the value gradient head dimension stride
     stride_dvn, # the value gradient sequence length dimension stride
+    stride_lseb, # the logsumexp batch dimension stride
+    stride_lseh, # the logsumexp head dimension stride
     nheads, # the number of attention heads
     seqlen_q, # the query sequence length
     seqlen_k, # the key sequence length
@@ -318,7 +324,7 @@ def _backward_kernel(
             qkT += tl.where(offsets_m[:, None] >= offsets_n[None, :], 0.0, -float("inf"))
         
         # load lse block
-        lse_ptrs = lse + b_idx * stride_qb + h_idx * stride_qh + offsets_m
+        lse_ptrs = lse + b_idx * stride_lseb + h_idx * stride_lseh + offsets_m
         if EVEN_M:
             lse_block = tl.load(lse_ptrs)
         else:
@@ -450,7 +456,9 @@ def _flash_attention_backward(q, k, v, o, do, dq, dk, dv, lse, scale: float=None
         dk.stride(2), 
         dv.stride(0), 
         dv.stride(1), 
-        dv.stride(2), 
+        dv.stride(2),
+        lse.stride(0),
+        lse.stride(1),
         n_heads, 
         q_seq_len, 
         k_seq_len, 
@@ -502,39 +510,38 @@ class FlashAttnFunc(torch.autograd.Function):
         return dq, dk, dv, None, None
         
         
-
 def test_forward(is_causal: bool=False):
     torch.manual_seed(0)
-    data_type = torch.float32
-    q = torch.randn(1, 1, 32, 16, dtype=data_type).cuda()
-    k = torch.randn(1, 1, 32, 16, dtype=data_type).cuda()
-    v = torch.randn(1, 1, 32, 16, dtype=data_type).cuda()
+    data_type = torch.float16
+    q = torch.randn(3, 4, 33, 16, dtype=data_type).cuda()
+    k = torch.randn(3, 4, 33, 16, dtype=data_type).cuda()
+    v = torch.randn(3, 4, 33, 16, dtype=data_type).cuda()
     
     o, lse = _flash_attention_forward(q, k, v, is_causal=is_causal)
     
     # torch attention
     o_torch = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
-    
-    # # check if the output is the same
     assert torch.allclose(o, o_torch, atol=1e-2)
     
     qkT = q @ k.transpose(-2, -1)
+    qkT = qkT.to(torch.float32)
     scale = 1.0 / math.sqrt(q.shape[-1])
     qkT = qkT * scale
     if is_causal:
         mask = torch.where(torch.arange(q.shape[-2])[:, None] >= torch.arange(k.shape[-2])[None, :], 0.0, -float("inf")).to(qkT.device)
         qkT += mask
-    max_value = torch.max(qkT, dim=-1).values
-    lse_torch = torch.logsumexp(qkT - max_value[..., None], dim=-1) + max_value
+    torch_max_value = torch.max(qkT, dim=-1).values
+    lse_torch = torch.logsumexp(qkT - torch_max_value[..., None], dim=-1) + torch_max_value
     assert torch.allclose(lse, lse_torch, atol=1e-2)
+    
     
     
 def test_backward(is_causal: bool=False):
     torch.manual_seed(0)
     data_type = torch.float16
-    q = torch.randn(1, 1, 16, 16, dtype=data_type).cuda().requires_grad_(True)
-    k = torch.randn(1, 1, 16, 16, dtype=data_type).cuda().requires_grad_(True)
-    v = torch.randn(1, 1, 16, 16, dtype=data_type).cuda().requires_grad_(True)
+    q = torch.randn(2, 4, 33, 16, dtype=data_type).cuda().requires_grad_(True)
+    k = torch.randn(2, 4, 33, 16, dtype=data_type).cuda().requires_grad_(True)
+    v = torch.randn(2, 4, 33, 16, dtype=data_type).cuda().requires_grad_(True)
     do = torch.randn_like(q)
     
     # torch attention
