@@ -1,3 +1,6 @@
+// to compile: nvcc mm.cu -o mm
+// to run: ./mm
+
 #include <stdio.h>
 #include <cuda_runtime.h>
 #include <iostream>
