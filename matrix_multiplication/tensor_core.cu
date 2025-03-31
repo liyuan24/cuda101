@@ -113,6 +113,7 @@ __global__ void wmma_mm_kernel(T1 const *A, T1 const *B, T2 *C, int m, int n, in
 template <typename T1, typename T2>
 void matrix_multiplication_cuda_wmma(T1 const *A, T1 const *B, T2 *C, int m, int n, int k) {
     // compile time constants
+    // for the valid values, please refer to https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-shape
     constexpr int WMMA_M = 16;
     constexpr int WMMA_N = 16;
     constexpr int WMMA_K = 16;
