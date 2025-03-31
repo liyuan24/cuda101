@@ -2,6 +2,10 @@
 // to compile: nvcc tensor_core.cu -o tensor_core --gpu-architecture=compute_86
 // to run: ./tensor_core
 
+// references
+// https://leimao.github.io/blog/NVIDIA-Tensor-Core-Programming/
+// https://developer.nvidia.com/blog/programming-tensor-cores-cuda-9/
+
 #include <stdio.h>
 #include <cuda_runtime.h>
 #include <iostream>

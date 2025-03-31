@@ -1,6 +1,9 @@
 // to compile: nvcc mm.cu -o mm
 // to run: ./mm
 
+// references
+// https://leimao.github.io/blog/CUDA-Matrix-Multiplication/
+
 #include <stdio.h>
 #include <cuda_runtime.h>
 #include <iostream>
