@@ -14,7 +14,6 @@
 #include <algorithm>
 #include <type_traits>
 
-#define BLOCK_SIZE 16
 #define WARP_SIZE 32
 
 #define checkCuda(val) check((val), #val, __FILE__, __LINE__)
